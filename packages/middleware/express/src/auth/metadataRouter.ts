@@ -32,6 +32,34 @@ export function allowedMethods(allowed: string[]): RequestHandler {
     };
 }
 
+function stripTrailingSlash(path: string): string {
+    return path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
+}
+
+function metadataMiddleware(metadata: OAuthMetadata | OAuthProtectedResourceMetadata): RequestHandler[] {
+    return [
+        // Metadata documents must be fetchable from web-based MCP clients on any origin.
+        cors(),
+        allowedMethods(['GET', 'OPTIONS']),
+        (_req, res) => {
+            res.status(200).json(metadata);
+        }
+    ];
+}
+
+function mountExactPath(router: Router, path: string, handlers: RequestHandler[]): void {
+    const expected = stripTrailingSlash(path);
+    const sub = express.Router();
+    sub.use(...handlers);
+    router.use((req, res, next) => {
+        if (stripTrailingSlash(req.path) !== expected) {
+            next();
+            return;
+        }
+        sub(req, res, next);
+    });
+}
+
 /**
  * Builds a small Express router that serves the given OAuth metadata document
  * at `/` as JSON, with permissive CORS and a GET/OPTIONS method allow-list.
@@ -41,12 +69,7 @@ export function allowedMethods(allowed: string[]): RequestHandler {
  */
 export function metadataHandler(metadata: OAuthMetadata | OAuthProtectedResourceMetadata): RequestHandler {
     const router = express.Router();
-    // Metadata documents must be fetchable from web-based MCP clients on any origin.
-    router.use(cors());
-    router.use(allowedMethods(['GET', 'OPTIONS']));
-    router.get('/', (_req, res) => {
-        res.status(200).json(metadata);
-    });
+    router.all('/', ...metadataMiddleware(metadata));
     return router;
 }
 
@@ -92,12 +115,17 @@ export function mcpAuthMetadataRouter(options: NeutralAuthMetadataOptions): Rout
 
     const router = express.Router();
 
-    // Serve PRM at the path-aware URL per RFC 9728 §3.1.
-    const rsPath = new URL(options.resourceServerUrl.href).pathname;
-    router.use(`/.well-known/oauth-protected-resource${rsPath === '/' ? '' : rsPath}`, metadataHandler(protectedResourceMetadata));
+    // Match literally (tolerating a single trailing slash) so RFC 3986 path
+    // characters are not parsed as route syntax and subpaths fall through.
+    const rsPath = stripTrailingSlash(new URL(options.resourceServerUrl.href).pathname);
+    mountExactPath(
+        router,
+        `/.well-known/oauth-protected-resource${rsPath === '/' ? '' : rsPath}`,
+        metadataMiddleware(protectedResourceMetadata)
+    );
 
     // Mirror the AS metadata at this origin for clients that look here first.
-    router.use('/.well-known/oauth-authorization-server', metadataHandler(options.oauthMetadata));
+    mountExactPath(router, '/.well-known/oauth-authorization-server', metadataMiddleware(options.oauthMetadata));
 
     return router;
 }
